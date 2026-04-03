@@ -14,11 +14,9 @@ export default async function handler(req, res) {
     const queryString = req.url.includes('?') ? req.url.split('?')[1] : '';
     const url = `${GAS_URL}?${queryString}`;
     const hasCallback = queryString.includes('callback=');
-    console.log('轉發到 GAS：', url);
     try {
       const response = await fetch(url, { redirect: 'follow' });
       const text = await response.text();
-      console.log('GAS 回傳：', text.substring(0, 200));
       res.setHeader('Content-Type', hasCallback ? 'application/javascript' : 'application/json');
       res.status(200).send(text);
     } catch (e) {
@@ -27,7 +25,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  // ── 寫入類：直接用 Google Sheets API ─────────────────────────────────────
+  // ── 寫入類：直接用 Google Sheets API + 回傳出席統計 ──────────────────────
   if (action === 'quickCheckin') {
     try {
       const auth = new google.auth.GoogleAuth({
@@ -46,13 +44,12 @@ export default async function handler(req, res) {
       const courseId  = params.courseId  || 'GN432';
       const color     = params.color     || '#A88BEB';
 
-      // ── 防重複：讀最後 100 列出席紀錄 ──────────────────────────────────
+      // ── 防重複：讀出席紀錄 A:D ─────────────────────────────────────────
       const readRes = await sheets.spreadsheets.values.get({
-        spreadsheetId: SHEET_ID,
-        range: '出席紀錄!A:D',
+        spreadsheetId: SHEET_ID, range: '出席紀錄!A:D',
       });
       const rows = readRes.data.values || [];
-      for (let i = Math.max(1, rows.length - 100); i < rows.length; i++) {
+      for (let i = Math.max(1, rows.length - 150); i < rows.length; i++) {
         if (rows[i][0] === sid && String(rows[i][3]) === String(studentId)) {
           res.status(200).json({ ok: true, alreadySigned: true });
           return;
@@ -62,45 +59,67 @@ export default async function handler(req, res) {
       // ── 寫入出席紀錄 ────────────────────────────────────────────────────
       const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
       await sheets.spreadsheets.values.append({
-        spreadsheetId: SHEET_ID,
-        range: '出席紀錄!A:I',
+        spreadsheetId: SHEET_ID, range: '出席紀錄!A:I',
         valueInputOption: 'USER_ENTERED',
-        resource: {
-          values: [[sid, courseId, name, studentId, '', now, '出席', '語音點名', color]]
-        }
+        resource: { values: [[sid, courseId, name, studentId, '', now, '出席', '語音點名', color]] }
       });
 
-      // ── ✅ 更新「簽到場次」實到人數（J欄）─────────────────────────────
-      // 讀取簽到場次找到對應場次列號
+      // ── 更新簽到場次實到人數（J欄）──────────────────────────────────────
       const sesRes = await sheets.spreadsheets.values.get({
-        spreadsheetId: SHEET_ID,
-        range: '簽到場次!A:J',
+        spreadsheetId: SHEET_ID, range: '簽到場次!A:J',
       });
       const sesRows = sesRes.data.values || [];
       let sesRowIndex = -1;
       for (let i = 1; i < sesRows.length; i++) {
-        if (sesRows[i][0] === sid) { sesRowIndex = i + 1; break; } // +1 因為 Sheets API 是 1-based
+        if (sesRows[i][0] === sid) { sesRowIndex = i + 1; break; }
       }
-
       if (sesRowIndex > 0) {
-        // 重新計算實到人數
+        // 重新讀最新出席紀錄計算人數
         const atRes = await sheets.spreadsheets.values.get({
-          spreadsheetId: SHEET_ID,
-          range: '出席紀錄!A:A',
+          spreadsheetId: SHEET_ID, range: '出席紀錄!A:A',
         });
         const atRows = atRes.data.values || [];
         const presentCount = atRows.filter((r, i) => i > 0 && r[0] === sid).length;
-
         await sheets.spreadsheets.values.update({
           spreadsheetId: SHEET_ID,
           range: `簽到場次!J${sesRowIndex}`,
           valueInputOption: 'USER_ENTERED',
           resource: { values: [[presentCount]] }
         });
-        console.log(`✅ 實到人數更新：場次 ${sid} → ${presentCount} 人`);
       }
 
-      res.status(200).json({ ok: true });
+      // ── ✅ 計算該學生本課程出席統計 ─────────────────────────────────────
+      // 1. 這個學生參加過幾場（包含今天）
+      const allAtRes = await sheets.spreadsheets.values.get({
+        spreadsheetId: SHEET_ID, range: '出席紀錄!A:D',
+      });
+      const allAtRows = allAtRes.data.values || [];
+      const studentSessionIds = new Set();
+      for (let i = 1; i < allAtRows.length; i++) {
+        if (allAtRows[i][1] === courseId && String(allAtRows[i][3]) === String(studentId)) {
+          studentSessionIds.add(allAtRows[i][0]);
+        }
+      }
+      const attendanceCount = studentSessionIds.size;
+
+      // 2. 這門課總共開了幾場
+      const allSesRes = await sheets.spreadsheets.values.get({
+        spreadsheetId: SHEET_ID, range: '簽到場次!A:B',
+      });
+      const allSesRows = allSesRes.data.values || [];
+      const totalSessions = allSesRows.filter((r, i) => i > 0 && r[1] === courseId).length;
+
+      // 3. 出席率
+      const attendanceRate = totalSessions > 0
+        ? Math.round(attendanceCount / totalSessions * 100) : 100;
+
+      res.status(200).json({
+        ok: true,
+        attendanceCount,   // 學生累計出席次數（含今天）
+        totalSessions,     // 課程總場次
+        attendanceRate,    // 出席率 %
+      });
+
     } catch (e) {
       console.error('錯誤：', e.message);
       res.status(500).json({ ok: false, error: e.message });
